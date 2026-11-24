@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from app import images, solver, storage
+from app import images, reuse, solver, storage
 from app.main import app, SOLVE_TIME_LIMIT
 
 RED = (220, 60, 60)
@@ -450,3 +450,514 @@ def test_add_point_out_of_palette_rejected(client):
         data={"cell_x": 0, "cell_y": 0, "color": "1,2,3"},
     )
     assert bad.status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# 旧草案复用（换起点重扫）
+# --------------------------------------------------------------------------- #
+
+# 非对称 4×4 模式：单元测试中 d1 与 d2 唯一且不同的确定性夹具
+_REUSE_GRID = [
+    [(4, 4, 4), (2, 2, 2), (4, 4, 4), (3, 3, 3)],
+    [(2, 2, 2), (4, 4, 4), (2, 2, 2), (2, 2, 2)],
+    [(2, 2, 2), (1, 1, 1), (4, 4, 4), (2, 2, 2)],
+    [(4, 4, 4), (4, 4, 4), (2, 2, 2), (3, 3, 3)],
+]
+_REUSE_OLD_FIXED = {
+    (0, 0): (4, 4, 4), (0, 1): (2, 2, 2), (1, 0): (2, 2, 2),
+}
+_REUSE_NEW_FIXED = {
+    (1, 0): (4, 4, 4), (1, 1): (2, 2, 2), (1, 3): (1, 1, 1),
+    (2, 0): (2, 2, 2),
+}
+_D1 = (1, 0)
+_D2 = (0, 1)
+
+# 端到端换起点夹具：非对称 8×8 模式（random.seed(11) 冻结）
+_RESCAN_GRID = [
+    [[230, 200, 70], [230, 200, 70], [230, 200, 70], [60, 90, 220],
+     [60, 90, 220], [230, 200, 70], [60, 90, 220], [220, 60, 60]],
+    [[230, 200, 70], [60, 180, 90], [60, 90, 220], [220, 60, 60],
+     [220, 60, 60], [230, 200, 70], [230, 200, 70], [60, 90, 220]],
+    [[220, 60, 60], [220, 60, 60], [220, 60, 60], [220, 60, 60],
+     [60, 90, 220], [60, 90, 220], [220, 60, 60], [230, 200, 70]],
+    [[60, 180, 90], [230, 200, 70], [60, 90, 220], [60, 90, 220],
+     [60, 180, 90], [230, 200, 70], [220, 60, 60], [220, 60, 60]],
+    [[230, 200, 70], [60, 180, 90], [230, 200, 70], [220, 60, 60],
+     [60, 180, 90], [60, 180, 90], [60, 90, 220], [60, 180, 90]],
+    [[220, 60, 60], [220, 60, 60], [220, 60, 60], [230, 200, 70],
+     [220, 60, 60], [60, 180, 90], [230, 200, 70], [220, 60, 60]],
+    [[220, 60, 60], [220, 60, 60], [60, 90, 220], [60, 90, 220],
+     [220, 60, 60], [230, 200, 70], [230, 200, 70], [230, 200, 70]],
+    [[230, 200, 70], [220, 60, 60], [60, 90, 220], [60, 180, 90],
+     [60, 180, 90], [220, 60, 60], [60, 180, 90], [60, 180, 90]],
+]
+_RESCAN_SHIFT = (3, 2)
+_RESCAN_CANVAS = 10  # 10×10 残片画布，单元 8×8
+
+
+def _rescan_fragments():
+    """返回 (旧残片色点, 新残片色点)，画布 10×10、透明处缺损。
+
+    旧扫描保留上 6 行；新扫描窗口平移 (3,2) 且保留上 8 行（多认出色点）。
+    """
+    w = h = _RESCAN_CANVAS
+    u = len(_RESCAN_GRID)
+    dx, dy = _RESCAN_SHIFT
+    old_points = {
+        (x, y): tuple(_RESCAN_GRID[y % u][x % u])
+        for y in range(6) for x in range(w)}
+    new_points = {
+        (xp, yp): tuple(
+            _RESCAN_GRID[(yp - dy) % u][(xp - dx) % u])
+        for yp in range(8) for xp in range(w)}
+    return old_points, new_points
+
+
+def _all_cells(grid):
+    return {
+        (x, y): tuple(grid[y][x])
+        for y in range(len(grid)) for x in range(len(grid[0]))
+    }
+
+
+def _fragment_from_cells(cells, size):
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    for (x, y), color in cells.items():
+        img.putpixel((x, y), (*color, 255))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _tile_counts_of(grid):
+    ref = images.parse_reference(png_bytes(grid))
+    return ref.tile_counts
+
+
+# ---- reuse 纯函数 ---------------------------------------------------------- #
+
+def test_proportional_ratio_same_and_scaled():
+    tc = _tile_counts_of(_REUSE_GRID)
+    # 同图：比例 1/1
+    assert reuse.proportional_ratio(tc, tc) == (1, 1)
+    # 全部频次乘 3：比例 3/1
+    scaled = {k: v * 3 for k, v in tc.items()}
+    assert reuse.proportional_ratio(tc, scaled) == (3, 1)
+    # 比例不一 -> None
+    broken = dict(scaled)
+    first = next(iter(broken))
+    broken[first] += 1
+    assert reuse.proportional_ratio(tc, broken) is None
+    # 种类不同 -> None
+    other = dict(list(tc.items())[:-1])
+    assert reuse.proportional_ratio(tc, other) is None
+
+
+def test_point_shift_and_grid_shift_distinct():
+    tc = _tile_counts_of(_REUSE_GRID)
+    assessment = reuse.assess_reuse(
+        old_status=solver.STATUS_OPTIMAL,
+        old_score=sum(tc.values()),
+        old_grid=tuple(tuple(row) for row in _REUSE_GRID),
+        old_fixed=dict(_REUSE_OLD_FIXED),
+        old_tile_counts=tc,
+        unit_w=4, unit_h=4,
+        new_tile_counts=tc,
+        new_fixed=dict(_REUSE_NEW_FIXED),
+    )
+    assert assessment.eligible
+    assert assessment.point_shift == _D1
+    assert assessment.grid_shift == _D2
+    assert _D1 != _D2
+    assert assessment.can_skip_solver
+    # 平移纹版确实符合全部新色点
+    assert reuse.grid_matches_points(
+        assessment.shifted_grid, _REUSE_NEW_FIXED)
+
+
+def test_assess_reuse_rejects_non_optimal_old_draft():
+    tc = _tile_counts_of(_REUSE_GRID)
+    assessment = reuse.assess_reuse(
+        old_status=solver.STATUS_FEASIBLE,
+        old_score=10,
+        old_grid=tuple(tuple(row) for row in _REUSE_GRID),
+        old_fixed=dict(_REUSE_OLD_FIXED),
+        old_tile_counts=tc,
+        unit_w=4, unit_h=4,
+        new_tile_counts=tc,
+        new_fixed=dict(_REUSE_NEW_FIXED),
+    )
+    assert not assessment.eligible
+    assert assessment.reason == reuse.REASON_OLD_NOT_OPTIMAL
+
+
+def test_assess_reuse_rejects_size_mismatch():
+    tc = _tile_counts_of(_REUSE_GRID)
+    assessment = reuse.assess_reuse(
+        old_status=solver.STATUS_OPTIMAL,
+        old_score=10,
+        old_grid=tuple(tuple(row) for row in _REUSE_GRID),
+        old_fixed=dict(_REUSE_OLD_FIXED),
+        old_tile_counts=tc,
+        unit_w=5, unit_h=4,  # 旧 grid 是 4×4
+        new_tile_counts=tc,
+        new_fixed=dict(_REUSE_NEW_FIXED),
+    )
+    assert not assessment.eligible
+    assert assessment.reason == reuse.REASON_SIZE_MISMATCH
+
+
+def test_assess_reuse_rejects_when_no_covering_shift():
+    tc = _tile_counts_of(_REUSE_GRID)
+    # 新残片放一个与旧点任何平移都冲突的颜色
+    new_fixed = {(0, 0): (1, 1, 1)}
+    assessment = reuse.assess_reuse(
+        old_status=solver.STATUS_OPTIMAL,
+        old_score=sum(tc.values()),
+        old_grid=tuple(tuple(row) for row in _REUSE_GRID),
+        old_fixed={(0, 0): (4, 4, 4)},
+        old_tile_counts=tc,
+        unit_w=4, unit_h=4,
+        new_tile_counts=tc,
+        new_fixed=new_fixed,
+    )
+    assert not assessment.eligible
+    assert assessment.reason == reuse.REASON_NO_COVERING_SHIFT
+
+
+def test_eligible_but_no_grid_shift_keeps_bound_only():
+    """覆盖平移存在但旧纹版无法符合全部新色点：只折算上界，不跳过求解。"""
+    tc = _tile_counts_of(_REUSE_GRID)
+    # 新色点：覆盖旧点（d1=(1,0)），但加入一个旧纹版任何平移都给不出的格
+    new_fixed = {
+        ((x + 1) % 4, y): c for (x, y), c in _REUSE_OLD_FIXED.items()}
+    new_fixed[(3, 3)] = (1, 1, 1)
+    assessment = reuse.assess_reuse(
+        old_status=solver.STATUS_OPTIMAL,
+        old_score=sum(tc.values()),
+        old_grid=tuple(tuple(row) for row in _REUSE_GRID),
+        old_fixed=dict(_REUSE_OLD_FIXED),
+        old_tile_counts=tc,
+        unit_w=4, unit_h=4,
+        new_tile_counts=tc,
+        new_fixed=new_fixed,
+    )
+    assert assessment.eligible
+    assert assessment.point_shift == (1, 0)
+    assert assessment.grid_shift is None
+    assert not assessment.can_skip_solver
+    assert assessment.scaled_bound == sum(tc.values())
+
+
+def test_scaled_bound_uses_frequency_ratio():
+    tc = _tile_counts_of(_REUSE_GRID)
+    grid = tuple(tuple(row) for row in _REUSE_GRID)
+    old_score = 18  # 该纹版在原参考图下的实际得分（含一个频次 2 的图块）
+    scaled_counts = {k: v * 2 for k, v in tc.items()}
+    assessment = reuse.assess_reuse(
+        old_status=solver.STATUS_OPTIMAL,
+        old_score=old_score,
+        old_grid=grid,
+        old_fixed={},
+        old_tile_counts=tc,
+        unit_w=4, unit_h=4,
+        new_tile_counts=scaled_counts,
+        new_fixed={},
+    )
+    assert assessment.eligible
+    assert assessment.ratio == (2, 1)
+    # 全空新残片：零位移即可直认，新得分严格按新频次折算
+    assert assessment.can_skip_solver
+    assert assessment.shifted_score == 2 * old_score
+    assert assessment.scaled_bound == 2 * old_score
+
+
+def test_shift_grid_toroidal_roundtrip():
+    grid = tuple(tuple(row) for row in _REUSE_GRID)
+    moved = reuse.shift_grid(grid, 3, 2, 4, 4)
+    back = reuse.shift_grid(moved, -3, -2, 4, 4)
+    assert back == grid
+
+
+# ---- solver 的折算上界提示 ------------------------------------------------- #
+
+def test_solver_upper_bound_hint_marks_optimal_early():
+    ref = images.parse_reference(png_bytes(stripes_grid(8)))
+    # 给一个与真实最优分相等的提示，应直接判最优且上界取提示值
+    result = solver.solve(ref.colors, ref.tile_counts, 6, 6, {},
+                          5.0, upper_bound_hint=36 * 32)
+    assert result.status == solver.STATUS_OPTIMAL
+    assert result.upper_bound == 36 * 32
+
+
+def test_solver_hint_does_not_lower_true_optimum_claim():
+    ref = images.parse_reference(png_bytes(stripes_grid(8)))
+    # 提示高于通用上界时，有效上界仍是通用上界
+    result = solver.solve(ref.colors, ref.tile_counts, 6, 6, {},
+                          5.0, upper_bound_hint=10 ** 9)
+    assert result.status == solver.STATUS_OPTIMAL
+    assert result.upper_bound == 36 * 32
+
+
+def test_backtrack_honors_upper_bound_hint():
+    ref = images.parse_reference(png_bytes(stripes_grid(8)))
+    bt = solver._solve_backtrack(
+        ref.colors, ref.tile_counts, 6, 6, {(2, 3): RED}, 5.0,
+        upper_bound_hint=36 * 32)
+    assert bt.status == solver.STATUS_OPTIMAL
+    assert bt.upper_bound == 36 * 32
+
+
+# ---- API 端到端：换起点重扫 ------------------------------------------------ #
+
+def _create_reuse_draft(client, fixed_cells, unit=4, grid=None):
+    grid = grid or _REUSE_GRID
+    resp = client.post(
+        "/api/drafts",
+        files={
+            "reference": ("ref.png", png_bytes(grid), "image/png"),
+            "fragment": ("frag.png", _fragment_from_cells(fixed_cells, unit),
+                         "image/png"),
+        },
+        data={"unit_w": unit, "unit_h": unit},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_rescan_skips_solver_with_shifted_pattern(client):
+    old_points, new_points = _rescan_fragments()
+    first = client.post(
+        "/api/drafts",
+        files={
+            "reference": ("ref.png", png_bytes(_RESCAN_GRID), "image/png"),
+            "fragment": (
+                "old.png",
+                _fragment_from_cells(old_points, _RESCAN_CANVAS),
+                "image/png"),
+        },
+        data={"unit_w": 8, "unit_h": 8},
+    )
+    assert first.status_code == 200, first.text
+    first_body = first.json()
+    assert first_body["status"] == "optimal"
+    # 旧求解器确实运行过（非复用直认）
+    assert first_body["solver"] != "reuse-toroidal-shift"
+    old_id = first_body["draft_id"]
+
+    resp = client.post(
+        "/api/drafts",
+        files={
+            "reference": ("ref.png", png_bytes(_RESCAN_GRID), "image/png"),
+            "fragment": (
+                "new.png",
+                _fragment_from_cells(new_points, _RESCAN_CANVAS),
+                "image/png"),
+        },
+        data={"unit_w": 8, "unit_h": 8,
+              "previous_draft_id": old_id},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["reuse"]["eligible"] is True
+    assert body["reuse"]["solver_skipped"] is True
+    assert body["reuse"]["point_shift"] == {
+        "dx": _RESCAN_SHIFT[0], "dy": _RESCAN_SHIFT[1]}
+    assert body["reuse"]["grid_shift"] == {
+        "dx": _RESCAN_SHIFT[0], "dy": _RESCAN_SHIFT[1]}
+    assert body["reuse"]["frequency_ratio"] == {
+        "numerator": 1, "denominator": 1}
+    # 跳过求解：求解器名是平移直认，状态已证最优
+    assert body["solver"] == "reuse-toroidal-shift"
+    assert body["status"] == "optimal"
+    # 生成的是独立新草案
+    assert body["draft_id"] != old_id
+    # 平移纹版符合全部新色点
+    new_fixed, conflicts = images.project_points(new_points, 8, 8)
+    assert conflicts == []
+    for (x, y), color in new_fixed.items():
+        assert body["candidate_grid"][y][x] == list(color)
+    # 新残片认出的格数不少于旧残片
+    old_fixed, _ = images.project_points(old_points, 8, 8)
+    assert len(new_fixed) >= len(old_fixed)
+    # 两份草案各自可领取 PNG
+    for did in (old_id, body["draft_id"]):
+        png = client.get(f"/api/drafts/{did}/pattern.png")
+        assert png.status_code == 200
+
+
+def test_rescan_without_previous_id_runs_normal_solver(client):
+    _, new_points = _rescan_fragments()
+    resp = client.post(
+        "/api/drafts",
+        files={
+            "reference": ("ref.png", png_bytes(_RESCAN_GRID), "image/png"),
+            "fragment": ("new.png",
+                         _fragment_from_cells(new_points, _RESCAN_CANVAS),
+                         "image/png"),
+        },
+        data={"unit_w": 8, "unit_h": 8},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "reuse" not in body
+    assert body["status"] in ("optimal", "feasible")
+
+
+def test_rescan_unknown_previous_draft_404(client):
+    _, new_points = _rescan_fragments()
+    resp = client.post(
+        "/api/drafts",
+        files={
+            "reference": ("ref.png", png_bytes(_RESCAN_GRID), "image/png"),
+            "fragment": ("new.png",
+                         _fragment_from_cells(new_points, _RESCAN_CANVAS),
+                         "image/png"),
+        },
+        data={"unit_w": 8, "unit_h": 8, "previous_draft_id": 9999},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["error"] == "not_found"
+
+
+def test_rescan_ineligible_falls_back_to_solver(client):
+    # 旧草案基于竖条纹参考图；新残片配另一参考图 -> 图块种类不同，照常求解
+    stripes = stripes_grid(8)
+    old = client.post(
+        "/api/drafts",
+        files=_files(stripes, stripes,
+                     frag_transparent=lambda x, y, c: (x, y) != (0, 0)),
+        data={"unit_w": 4, "unit_h": 4},
+    )
+    old_id = old.json()["draft_id"]
+
+    resp = client.post(
+        "/api/drafts",
+        files={
+            "reference": ("ref.png", png_bytes(_REUSE_GRID), "image/png"),
+            "fragment": ("frag.png",
+                         _fragment_from_cells(_REUSE_NEW_FIXED, 4),
+                         "image/png"),
+        },
+        data={"unit_w": 4, "unit_h": 4,
+              "previous_draft_id": old_id},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["reuse"]["eligible"] is False
+    assert body["reuse"]["reason"] == reuse.REASON_TILE_KIND_MISMATCH
+    assert body["reuse"]["solver_skipped"] is False
+    assert body["solver"] != "reuse-toroidal-shift"
+    assert "draft_id" in body
+
+
+def test_rescan_eligible_bound_but_no_grid_shift_invokes_solver(client):
+    tc = _tile_counts_of(_REUSE_GRID)
+    first = _create_reuse_draft(client, _REUSE_OLD_FIXED)
+    old_id = first["draft_id"]
+
+    new_fixed = {
+        ((x + 1) % 4, y): c for (x, y), c in _REUSE_OLD_FIXED.items()}
+    new_fixed[(3, 3)] = (1, 1, 1)
+    resp = client.post(
+        "/api/drafts",
+        files={
+            "reference": ("ref.png", png_bytes(_REUSE_GRID), "image/png"),
+            "fragment": ("frag.png", _fragment_from_cells(new_fixed, 4),
+                         "image/png"),
+        },
+        data={"unit_w": 4, "unit_h": 4,
+              "previous_draft_id": old_id},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["reuse"]["eligible"] is True
+    assert body["reuse"]["solver_skipped"] is False
+    # 折算上界 = min(旧最优分, 通用上界)；该参考图通用上界为 16×最高频次 2
+    assert body["reuse"]["scaled_upper_bound"] == min(
+        first["score"], 16 * max(tc.values()))
+    assert body["solver"] != "reuse-toroidal-shift"
+
+
+def test_rescan_scaled_ratio_through_api(client):
+    """新参考图由 4×4 模式双向平铺成 8×8：同图块种类、整体频次 ×4。"""
+    first = _create_reuse_draft(client, _all_cells(_REUSE_GRID))
+    assert first["status"] == "optimal"
+    old_id = first["draft_id"]
+    old_score = first["score"]
+
+    # 8×8 平铺参考图：每个 4×4 位置的图块各出现 4 次
+    big = [
+        [_REUSE_GRID[y % 4][x % 4] for x in range(8)]
+        for y in range(8)
+    ]
+    # 新残片沿用旧草案全部色点（零位移覆盖），保证折算条件成立
+    resp = client.post(
+        "/api/drafts",
+        files={
+            "reference": ("ref8.png", png_bytes(big), "image/png"),
+            "fragment": (
+                "frag.png",
+                _fragment_from_cells(_all_cells(_REUSE_GRID), 4),
+                "image/png"),
+        },
+        data={"unit_w": 4, "unit_h": 4,
+              "previous_draft_id": old_id},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["reuse"]["eligible"] is True
+    assert body["reuse"]["frequency_ratio"] == {
+        "numerator": 4, "denominator": 1}
+    assert body["reuse"]["solver_skipped"] is True
+    assert body["score"] == 4 * old_score
+    assert body["upper_bound"] == 4 * old_score
+
+
+def test_two_drafts_serve_their_own_patterns(client):
+    old_points, new_points = _rescan_fragments()
+    first = client.post(
+        "/api/drafts",
+        files={
+            "reference": ("ref.png", png_bytes(_RESCAN_GRID), "image/png"),
+            "fragment": ("old.png",
+                         _fragment_from_cells(old_points, _RESCAN_CANVAS),
+                         "image/png"),
+        },
+        data={"unit_w": 8, "unit_h": 8},
+    ).json()
+    old_id = first["draft_id"]
+    second = client.post(
+        "/api/drafts",
+        files={
+            "reference": ("ref.png", png_bytes(_RESCAN_GRID), "image/png"),
+            "fragment": ("new.png",
+                         _fragment_from_cells(new_points, _RESCAN_CANVAS),
+                         "image/png"),
+        },
+        data={"unit_w": 8, "unit_h": 8,
+              "previous_draft_id": old_id},
+    ).json()
+    assert second["reuse"]["solver_skipped"] is True
+    new_id = second["draft_id"]
+
+    old_png = client.get(f"/api/drafts/{old_id}/pattern.png").content
+    new_png = client.get(f"/api/drafts/{new_id}/pattern.png").content
+    old_im = Image.open(io.BytesIO(old_png)).convert("RGB")
+    new_im = Image.open(io.BytesIO(new_png)).convert("RGB")
+    old_pixels = [old_im.getpixel((x, y)) for y in range(8) for x in range(8)]
+    new_pixels = [new_im.getpixel((x, y)) for y in range(8) for x in range(8)]
+    # 两份 PNG 不同（新纹版是旧纹版经 (3,2) 环绕平移的结果）
+    assert old_pixels != new_pixels
+    # 且恰为环绕平移关系：new(x,y) == old(x-3, y-2)
+    dx, dy = _RESCAN_SHIFT
+    for y in range(8):
+        for x in range(8):
+            assert new_im.getpixel((x, y)) == \
+                old_im.getpixel(((x - dx) % 8, (y - dy) % 8))
+    # 新 PNG 逐格符合新色点
+    new_fixed, _ = images.project_points(new_points, 8, 8)
+    for (x, y), color in new_fixed.items():
+        assert new_im.getpixel((x, y)) == color
+

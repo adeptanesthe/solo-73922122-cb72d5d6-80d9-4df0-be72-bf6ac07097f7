@@ -10,12 +10,13 @@
 ├── app/
 │   ├── images.py    # PNG 解析/校验、周期投影、2×2 图块统计
 │   ├── solver.py    # CP-SAT 可行性 + 局部搜索优化 + 回溯兜底
+│   ├── reuse.py     # 旧草案复用：频次比例折算上界、环绕平移直认
 │   ├── storage.py   # 草案 SQLite 持久化
 │   └── main.py      # FastAPI 路由
 ├── tests/
-│   └── test_app.py  # 26 个单元/端到端测试
+│   └── test_app.py  # 44 个单元/端到端测试
 ├── demo/
-│   ├── make_demo_data.py   # 生成演示 PNG
+│   ├── make_demo_data.py   # 生成演示 PNG（含换起点重扫三件套）
 │   ├── demo_requests.sh    # 可直接运行的 curl 演示
 │   └── *.png               # 演示图片
 ├── Dockerfile
@@ -29,7 +30,7 @@
 docker compose up --build -d
 # 健康检查
 curl http://127.0.0.1:8000/health
-# 跑全套演示请求（创建草案、补录、冲突、领取 PNG）
+# 跑全套演示请求（创建草案、补录、冲突、换起点重扫跳过求解、领取 PNG）
 bash demo/demo_requests.sh
 ```
 
@@ -67,10 +68,35 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ## API
 
 ### `POST /api/drafts`
-multipart 表单：`reference`（PNG）、`fragment`（PNG）、`unit_w`、`unit_h`。
+multipart 表单：`reference`（PNG）、`fragment`（PNG）、`unit_w`、`unit_h`，
+可选 `previous_draft_id`（换起点重扫时附旧草案编号）。
 
 - 同格异色（周期对齐后）→ `409`，返回冲突格与残片**两处原坐标**，不建草案。
 - 正常 → 返回状态、图块频次统计、候选网格；有候选时返回 `draft_id`。
+- 附了不存在的旧草案编号 → `404`。
+
+#### 换起点重扫与旧草案复用（`previous_draft_id`）
+
+对同一纹样换起点重新扫描、可能多认出几个完好色点时，可在请求里附上一份
+**已证最优**的旧草案编号。系统按以下顺序判定（响应中的 `reuse` 字段说明结果）：
+
+1. **前置条件**：新旧单元同尺寸；新旧参考图的 2×2 图块**种类相同**且各图块
+   频次成**同一比例** `r = new_count / old_count`（精确分数比较，无浮点误差）；
+   旧草案的每个固定色点都能经某个**环绕平移 d1** 后落在新残片投影的同色点上。
+2. **折算上界**：条件满足时，旧最优分按比例折算
+   `floor(r × S_old)`（再与通用上界 `格数 × 最高新频次` 取小），作为本次上界。
+3. **平移直认（跳过求解）**：若旧纹版还能经某个环绕平移 **d2**（允许与 d1
+   不同位移）符合全部新色点，则平移后的纹版新得分恰为 `r × S_old`、达到折算
+   上界，直接标记**已证最优**并跳过求解，`solver` 为 `reuse-toroidal-shift`，
+   `reuse.solver_skipped=true`。
+4. **只折算、不直认**：d2 不存在时照常限时求解，但合法候选一达到折算上界即
+   停搜并标记已证最优（CP-SAT 局部搜索与内置回溯两条路径都支持）。
+5. **无法折算**：任一前置条件不满足时走原求解流程，`reuse.eligible=false`
+   并给出机器可读的受阻原因（`old_not_optimal` / `size_mismatch` /
+   `tile_kind_mismatch` / `frequency_ratio_mismatch` / `no_covering_shift`）。
+
+无论是否复用，只要有候选就**另存为新草案**，按新参考图的频次计分与统计；
+两份草案日后各自按自己的补录结果发放 PNG。同格异色检查与 5 秒求解上限保持不变。
 
 ### `POST /api/drafts/{id}/points`
 在缺损处补录完好色点。表单：`color=r,g,b`，坐标二选一：
@@ -96,9 +122,21 @@ multipart 表单：`reference`（PNG）、`fragment`（PNG）、`unit_w`、`unit
 
 无 OR-Tools 时自动退回内置的行编码回溯 + 分支定界（带递归剪枝与时限检查）。
 
+### 旧草案复用（`app/reuse.py`）
+
+- 用整数交叉相乘校验频次比例（`new_count × den == old_count × num`），
+  比例约分后返回 `(numerator, denominator)`。
+- 环绕平移在 `W×H` 个位移内穷举：d1 检查旧色点覆盖（单元 ≤12，至多 144 个
+  位移、每位移几十条色点），d2 检查纹版是否符合全部新色点。
+- 平移只置换 2×2 图块的位置而不改变图块种类，故平移纹版的新得分严格等于
+  `r × S_old`；达到折算上界即可声明已证最优，无需调用求解器。
+- 折算上界作为 `upper_bound_hint` 传入求解器，CP-SAT 与回溯兜底都会在合法
+  候选命中该上界时提前停搜。
+
 ## 测试
 
 ```bash
 pip install pytest httpx
 python -m pytest tests/ -v
+PYTHONPATH=. python tests/verify_requirements.py   # 需求逐条核对
 ```

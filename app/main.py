@@ -49,6 +49,7 @@ from .solver import (
     SolveResult,
     solve,
 )
+from . import reuse as reuse_mod
 from .storage import DEFAULT_DB_PATH, DraftStore
 
 SOLVE_TIME_LIMIT = 5.0
@@ -147,6 +148,7 @@ def _solve_payload(
     tile_counts: dict[TileKey, int],
     fixed: dict[tuple[int, int], RGB],
     draft_id: Optional[int],
+    reuse_info: Optional[dict] = None,
 ) -> dict:
     payload = {
         "status": result.status,
@@ -169,7 +171,34 @@ def _solve_payload(
     if draft_id is not None:
         payload["draft_id"] = draft_id
         payload["pattern_url"] = f"/api/drafts/{draft_id}/pattern.png"
+    if reuse_info is not None:
+        payload["reuse"] = reuse_info
     return payload
+
+
+def _reuse_payload(
+    previous_draft_id: int,
+    assessment: reuse_mod.ReuseAssessment,
+    solver_skipped: bool,
+) -> dict:
+    """组装旧草案复用情况（响应中的 ``reuse`` 字段）。"""
+    return {
+        "previous_draft_id": previous_draft_id,
+        "eligible": assessment.eligible,
+        "reason": assessment.reason,
+        "message": assessment.message,
+        "solver_skipped": solver_skipped,
+        "frequency_ratio": (
+            {"numerator": assessment.ratio[0], "denominator": assessment.ratio[1]}
+            if assessment.ratio is not None else None),
+        "point_shift": (
+            {"dx": assessment.point_shift[0], "dy": assessment.point_shift[1]}
+            if assessment.point_shift is not None else None),
+        "scaled_upper_bound": assessment.scaled_bound,
+        "grid_shift": (
+            {"dx": assessment.grid_shift[0], "dy": assessment.grid_shift[1]}
+            if assessment.grid_shift is not None else None),
+    }
 
 
 def _parse_rgb(raw: str) -> RGB:
@@ -200,6 +229,8 @@ async def create_draft(
     fragment: UploadFile = File(..., description="残片 PNG，透明像素标缺损"),
     unit_w: int = Form(..., description=f"重复单元宽（格），{MIN_UNIT}～{MAX_UNIT}"),
     unit_h: int = Form(..., description=f"重复单元高（格），{MIN_UNIT}～{MAX_UNIT}"),
+    previous_draft_id: Optional[int] = Form(
+        None, ge=1, description="换起点重扫时附旧草案编号，尝试折算上界/平移直认"),
 ):
     validate_unit_size(unit_w, unit_h)
     ref = parse_reference(await reference.read())
@@ -209,8 +240,54 @@ async def create_draft(
     if conflicts:
         raise ConflictError(_conflict_payload(conflicts, unit_w, unit_h))
 
-    result = solve(ref.colors, ref.tile_counts, unit_w, unit_h, fixed,
-                   SOLVE_TIME_LIMIT)
+    reuse_info: Optional[dict] = None
+    result: Optional[SolveResult] = None
+
+    if previous_draft_id is not None:
+        old_row = store().get_draft(previous_draft_id)
+        if old_row is None:
+            raise HTTPException(status_code=404, detail={
+                "error": "not_found",
+                "message": f"旧草案 {previous_draft_id} 不存在"})
+
+        old_tile_counts = _tile_counts_from_rows(
+            json.loads(old_row["tile_counts"]))
+        old_fixed = DraftStore.decode_points(old_row["fixed_points"])
+        old_grid = DraftStore.decode_grid(old_row["grid"])
+
+        assessment = reuse_mod.assess_reuse(
+            old_status=old_row["status"],
+            old_score=old_row["score"],
+            old_grid=old_grid,
+            old_fixed=old_fixed,
+            old_tile_counts=old_tile_counts,
+            unit_w=unit_w,
+            unit_h=unit_h,
+            new_tile_counts=ref.tile_counts,
+            new_fixed=fixed,
+        )
+
+        if assessment.can_skip_solver:
+            # 平移后的旧纹版符合全部新色点且达到折算上界：跳过求解，
+            # 直接标记为已证最优
+            result = reuse_mod.build_skip_result(
+                assessment, ref.tile_counts, unit_w, unit_h)
+            reuse_info = _reuse_payload(
+                previous_draft_id, assessment, solver_skipped=True)
+        else:
+            reuse_info = _reuse_payload(
+                previous_draft_id, assessment, solver_skipped=False)
+            if assessment.eligible:
+                # 有折算上界但旧纹版无法平移覆盖全部新色点：照常求解，
+                # 合法候选一达到折算上界即停搜
+                result = solve(ref.colors, ref.tile_counts, unit_w, unit_h,
+                               fixed, SOLVE_TIME_LIMIT,
+                               upper_bound_hint=assessment.scaled_bound)
+            # 无法折算（eligible=False）时走原求解流程
+
+    if result is None:
+        result = solve(ref.colors, ref.tile_counts, unit_w, unit_h, fixed,
+                       SOLVE_TIME_LIMIT)
 
     draft_id: Optional[int] = None
     if result.status in (STATUS_OPTIMAL, STATUS_FEASIBLE):
@@ -220,7 +297,7 @@ async def create_draft(
             fixed_points=fixed,
         )
     return _solve_payload(result, unit_w, unit_h, ref.colors,
-                          ref.tile_counts, fixed, draft_id)
+                          ref.tile_counts, fixed, draft_id, reuse_info)
 
 
 @app.post("/api/drafts/{draft_id}/points")

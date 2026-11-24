@@ -8,6 +8,10 @@
 * ``fragment_checker.png``   棋盘格残片
 * ``reference_conflict.png`` 6×6 参考图，用于制造同格异色冲突
 * ``fragment_conflict.png``  周期投影后同格异色的残片
+* ``reference_rescan.png``   8×8 非对称四色参考图（换起点重扫演示）
+* ``fragment_rescan_old.png`` 首次扫描残片（10×10 画布，上 6 行完好）
+* ``fragment_rescan_new.png`` 换起点后重扫残片（窗口平移 (3,2)，上 8 行完好，
+  多认出若干色点，配合 ``previous_draft_id`` 可跳过求解）
 
 直接执行：``python demo/make_demo_data.py``
 """
@@ -15,6 +19,7 @@
 from __future__ import annotations
 
 import os
+import random
 from io import BytesIO
 from pathlib import Path
 
@@ -27,6 +32,14 @@ BLUE = (60, 90, 220, 255)
 GREEN = (60, 180, 90, 255)
 YELLOW = (230, 200, 70, 255)
 TRANSPARENT = (0, 0, 0, 0)
+
+# 换起点演示参数（与 tests/test_app.py 的 _RESCAN_* 夹具保持一致）
+RESCAN_UNIT = 8
+RESCAN_CANVAS = 10
+RESCAN_SHIFT = (3, 2)
+RESCAN_OLD_ROWS = 6
+RESCAN_NEW_ROWS = 8
+_RESCAN_SEED = 11
 
 
 def save(img: Image.Image, name: str) -> Path:
@@ -91,6 +104,55 @@ def conflict_artifacts(size: int = 6) -> tuple[Image.Image, Image.Image]:
     return ref, frag
 
 
+def rescan_artifacts() -> tuple[Image.Image, Image.Image, Image.Image]:
+    """换起点重扫演示：非对称参考图 + 两次扫描残片。
+
+    参考图是 8×8 非对称四色模式（固定随机种子，保证可复现）；
+    两张残片均为 10×10 画布，透明像素标缺损：
+
+    * 旧残片只保留上 6 行（投影覆盖 48 个不同纹版格）；
+    * 新残片对应扫描窗口平移 (3,2)，保留上 8 行（覆盖全部 64 格），
+      旧残片的完好色点经平移 (3,2) 后全部被新残片同色覆盖。
+    """
+    rng = random.Random(_RESCAN_SEED)
+    palette = [RED[:3], BLUE[:3], GREEN[:3], YELLOW[:3]]
+    u = RESCAN_UNIT
+    while True:
+        grid = [
+            [rng.choice(palette) for _ in range(u)] for _ in range(u)]
+        symmetric = any(
+            (dx, dy) != (0, 0)
+            and all(
+                grid[y][x] == grid[(y - dy) % u][(x - dx) % u]
+                for y in range(u) for x in range(u))
+            for dy in range(u) for dx in range(u))
+        if not symmetric:
+            break
+
+    reference = Image.new("RGBA", (u, u))
+    for y in range(u):
+        for x in range(u):
+            reference.putpixel((x, y), (*grid[y][x], 255))
+
+    dx, dy = RESCAN_SHIFT
+    old_fragment = Image.new(
+        "RGBA", (RESCAN_CANVAS, RESCAN_CANVAS), TRANSPARENT)
+    for y in range(RESCAN_OLD_ROWS):
+        for x in range(RESCAN_CANVAS):
+            old_fragment.putpixel(
+                (x, y), (*grid[y % u][x % u], 255))
+
+    # 新扫描窗口相对旧窗口平移 (dx,dy)：新画布坐标 (xp,yp) 对应
+    # 模式格 (xp-dx, yp-dy)
+    new_fragment = Image.new(
+        "RGBA", (RESCAN_CANVAS, RESCAN_CANVAS), TRANSPARENT)
+    for yp in range(RESCAN_NEW_ROWS):
+        for xp in range(RESCAN_CANVAS):
+            color = grid[(yp - dy) % u][(xp - dx) % u]
+            new_fragment.putpixel((xp, yp), (*color, 255))
+    return reference, old_fragment, new_fragment
+
+
 def main() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
     artifacts = [
@@ -102,6 +164,12 @@ def main() -> None:
     ref_conflict, frag_conflict = conflict_artifacts()
     artifacts.append((ref_conflict, "reference_conflict.png"))
     artifacts.append((frag_conflict, "fragment_conflict.png"))
+    rescan_ref, rescan_old, rescan_new = rescan_artifacts()
+    artifacts.extend([
+        (rescan_ref, "reference_rescan.png"),
+        (rescan_old, "fragment_rescan_old.png"),
+        (rescan_new, "fragment_rescan_new.png"),
+    ])
 
     for img, name in artifacts:
         path = save(img, name)

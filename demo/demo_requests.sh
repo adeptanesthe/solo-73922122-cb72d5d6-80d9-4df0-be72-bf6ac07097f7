@@ -58,5 +58,42 @@ curl -sS -X POST "${BASE_URL}/api/drafts" \
     -F "fragment=@${DEMO_DIR}/fragment_checker.png;type=image/png" \
     -F "unit_w=4" -F "unit_h=4" | python3 -m json.tool
 
+echo "== 8. 换起点重扫（首次扫描，期望正常求解并已证最优）=="
+first_resp=$(curl -sS -X POST "${BASE_URL}/api/drafts" \
+    -F "reference=@${DEMO_DIR}/reference_rescan.png;type=image/png" \
+    -F "fragment=@${DEMO_DIR}/fragment_rescan_old.png;type=image/png" \
+    -F "unit_w=8" -F "unit_h=8")
+echo "${first_resp}" | python3 -m json.tool
+first_draft_id=$(echo "${first_resp}" | python3 -c "import sys,json; print(json.load(sys.stdin)['draft_id'])")
+test -n "${first_draft_id}" || { echo "未获得旧草案编号，终止"; exit 1; }
+
+echo "== 9. 换起点重扫（附旧草案编号，期望跳过求解、平移直认已证最优）=="
+# 新扫描窗口相对旧窗口平移 (3,2)，多认出若干完好色点；
+# 旧色点经环绕平移后被新残片同色覆盖，且旧纹版平移后符合全部新色点。
+rescan_resp=$(curl -sS -X POST "${BASE_URL}/api/drafts" \
+    -F "reference=@${DEMO_DIR}/reference_rescan.png;type=image/png" \
+    -F "fragment=@${DEMO_DIR}/fragment_rescan_new.png;type=image/png" \
+    -F "unit_w=8" -F "unit_h=8" \
+    -F "previous_draft_id=${first_draft_id}")
+echo "${rescan_resp}" | python3 -m json.tool
+echo "${rescan_resp}" | python3 -c "
+import sys, json
+body = json.load(sys.stdin)
+reuse = body['reuse']
+assert reuse['eligible'] is True, '应满足折算条件'
+assert reuse['solver_skipped'] is True, '应跳过求解'
+assert body['solver'] == 'reuse-toroidal-shift'
+assert body['status'] == 'optimal'
+print('校验通过：solver_skipped=True，状态 optimal，求解器', body['solver'])
+"
+rescan_draft_id=$(echo "${rescan_resp}" | python3 -c "import sys,json; print(json.load(sys.stdin)['draft_id'])")
+
+echo "== 10. 两份草案各自领取自己的纹版 PNG =="
+curl -sS -o "${OUT_DIR}/pattern_${first_draft_id}.png" -w "旧草案 HTTP %{http_code}\n" \
+    "${BASE_URL}/api/drafts/${first_draft_id}/pattern.png?scale=8"
+curl -sS -o "${OUT_DIR}/pattern_${rescan_draft_id}.png" -w "新草案 HTTP %{http_code}\n" \
+    "${BASE_URL}/api/drafts/${rescan_draft_id}/pattern.png?scale=8"
+file "${OUT_DIR}/pattern_${first_draft_id}.png" "${OUT_DIR}/pattern_${rescan_draft_id}.png" || true
+
 echo
 echo "演示完成，输出目录：${OUT_DIR}"

@@ -4,8 +4,12 @@ import sys
 
 from PIL import Image
 
-from app import images, solver
-from tests.test_app import png_bytes, stripes_grid, checker_grid
+from app import images, reuse, solver
+from tests.test_app import (
+    png_bytes, stripes_grid, checker_grid,
+    _REUSE_GRID, _REUSE_OLD_FIXED, _REUSE_NEW_FIXED, _D1, _D2,
+    _RESCAN_GRID, _rescan_fragments, _RESCAN_SHIFT,
+)
 
 RED = (220, 60, 60)
 BLUE = (60, 90, 220)
@@ -106,5 +110,82 @@ bt = solver._solve_backtrack(ref.colors, ref.tile_counts, 6, 6, {(2, 3): RED}, 5
 cp = solver._solve_cpsat(ref.colors, ref.tile_counts, 6, 6, {(2, 3): RED}, 5.0)
 check("回溯/CP-SAT 最优性一致", bt.status == cp.status == solver.STATUS_OPTIMAL)
 check("回溯/CP-SAT 得分一致", bt.score == cp.score)
+
+# 13. 图块频次同比例判定（整数精确比较）
+rt = images.parse_reference(png_bytes(_REUSE_GRID)).tile_counts
+check("同表比例 1:1", reuse.proportional_ratio(rt, rt) == (1, 1))
+scaled = {k: v * 3 for k, v in rt.items()}
+check("频次整体 ×3 比例 3:1", reuse.proportional_ratio(rt, scaled) == (3, 1))
+broken = dict(scaled)
+broken[next(iter(broken))] += 1
+check("比例不一拒绝折算", reuse.proportional_ratio(rt, broken) is None)
+check("种类不同拒绝折算",
+      reuse.proportional_ratio(rt, dict(list(rt.items())[:-1])) is None)
+
+# 14. 两次平移可不同：d1 覆盖旧色点、d2 纹版符合新色点
+assessment = reuse.assess_reuse(
+    old_status=solver.STATUS_OPTIMAL,
+    old_score=18,
+    old_grid=tuple(tuple(row) for row in _REUSE_GRID),
+    old_fixed=dict(_REUSE_OLD_FIXED),
+    old_tile_counts=rt,
+    unit_w=4, unit_h=4,
+    new_tile_counts=rt,
+    new_fixed=dict(_REUSE_NEW_FIXED),
+)
+check("折算条件成立", assessment.eligible)
+check("d1 与 d2 可为不同位移",
+      assessment.point_shift == _D1 and assessment.grid_shift == _D2
+      and _D1 != _D2)
+check("平移纹版符合全部新色点",
+      reuse.grid_matches_points(assessment.shifted_grid, _REUSE_NEW_FIXED))
+skip = reuse.build_skip_result(assessment, rt, 4, 4)
+check("直认结果已证最优且不调求解器",
+      skip.status == solver.STATUS_OPTIMAL
+      and skip.solver_name == "reuse-toroidal-shift")
+
+# 15. 无法折算的各类原因
+rej = reuse.assess_reuse(
+    old_status=solver.STATUS_FEASIBLE, old_score=1,
+    old_grid=tuple(tuple(row) for row in _REUSE_GRID),
+    old_fixed={}, old_tile_counts=rt, unit_w=4, unit_h=4,
+    new_tile_counts=rt, new_fixed={})
+check("非最优旧草案拒绝折算",
+      not rej.eligible and rej.reason == reuse.REASON_OLD_NOT_OPTIMAL)
+rej2 = reuse.assess_reuse(
+    old_status=solver.STATUS_OPTIMAL, old_score=1,
+    old_grid=tuple(tuple(row) for row in _REUSE_GRID),
+    old_fixed={(0, 0): (4, 4, 4)}, old_tile_counts=rt,
+    unit_w=4, unit_h=4, new_tile_counts=rt,
+    new_fixed={(0, 0): (1, 1, 1)})
+check("无覆盖平移拒绝折算",
+      not rej2.eligible and rej2.reason == reuse.REASON_NO_COVERING_SHIFT)
+
+# 16. 折算上界提示：求解器合法候选命中即停搜并标最优
+hinted = solver.solve(
+    ref.colors, ref.tile_counts, 6, 6, {}, 5.0,
+    upper_bound_hint=36 * 32)
+check("折算上界提示下声明已证最优",
+      hinted.status == solver.STATUS_OPTIMAL
+      and hinted.upper_bound == 36 * 32)
+bt_hint = solver._solve_backtrack(
+    ref.colors, ref.tile_counts, 6, 6, {(2, 3): RED}, 5.0,
+    upper_bound_hint=36 * 32)
+check("回溯路径同样遵守折算上界",
+      bt_hint.status == solver.STATUS_OPTIMAL
+      and bt_hint.upper_bound == 36 * 32)
+
+# 17. 换起点演示夹具：旧点经 d 平移被新残片覆盖，新残片认出更多格
+old_points, new_points = _rescan_fragments()
+old_fixed, c1 = images.project_points(old_points, 8, 8)
+new_fixed, c2 = images.project_points(new_points, 8, 8)
+check("演示残片无同格异色", c1 == [] and c2 == [])
+check("新残片认出格数不少于旧残片", len(new_fixed) >= len(old_fixed))
+cover = reuse.find_point_shift(old_fixed, new_fixed, 8, 8)
+check("旧色点可经演示位移被新残片覆盖", cover == _RESCAN_SHIFT)
+demo_grid = tuple(tuple(tuple(c) for c in row) for row in _RESCAN_GRID)
+assert len(demo_grid) == 8 and len(demo_grid[0]) == 8
+gshift = reuse.find_grid_shift(demo_grid, new_fixed, 8, 8)
+check("旧纹版可平移符合全部新色点", gshift == _RESCAN_SHIFT)
 
 print(f"\n全部 {ok} 项需求核对通过")

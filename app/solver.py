@@ -68,6 +68,7 @@ def solve(
     unit_h: int,
     fixed: dict[tuple[int, int], RGB],
     time_limit: float = 5.0,
+    upper_bound_hint: Optional[int] = None,
 ) -> SolveResult:
     """按启动时色点求解纹版。
 
@@ -83,13 +84,17 @@ def solve(
         固定格约束 ``{(x, y): rgb}``。
     time_limit:
         墙钟限时（秒），默认 5 秒。
+    upper_bound_hint:
+        外部已证明的最优分上界（如旧草案按频次比例折算的上界）。
+        合法候选一达到该上界即停搜并声明已证最优；与通用上界取小。
+        ``None`` 时只使用通用上界 ``格数 × 最高频图块频次``。
     """
     try:
         return _solve_cpsat(palette, tile_counts, unit_w, unit_h, fixed,
-                            time_limit)
+                            time_limit, upper_bound_hint)
     except ImportError:
         return _solve_backtrack(palette, tile_counts, unit_w, unit_h, fixed,
-                                time_limit)
+                                time_limit, upper_bound_hint)
 
 
 # --------------------------------------------------------------------------- #
@@ -181,6 +186,7 @@ def _solve_cpsat(
     unit_h: int,
     fixed: dict[tuple[int, int], RGB],
     time_limit: float,
+    upper_bound_hint: Optional[int] = None,
 ) -> SolveResult:
     from ortools.sat.python import cp_model
 
@@ -190,6 +196,12 @@ def _solve_cpsat(
     safety_margin = min(0.75, float(time_limit) * 0.15)
     deadline = started + float(time_limit) - safety_margin
     color_index = {c: i for i, c in enumerate(palette)}
+
+    # 有效上界 = min(通用上界, 外部折算上界)
+    generic_bound = unit_w * unit_h * _max_freq(tile_counts)
+    effective_bound = generic_bound
+    if upper_bound_hint is not None:
+        effective_bound = min(effective_bound, upper_bound_hint)
 
     # 快速拒绝：固定色不在参考图调色板中 -> 无解
     for color in fixed.values():
@@ -233,9 +245,10 @@ def _solve_cpsat(
         rgb_grid = tuple(
             tuple(palette[idx_grid[y][x]] for x in range(unit_w))
             for y in range(unit_h))
+        # CP-SAT 已严格证明最优；上界取折算上界与真最优分的小者
         result = SolveResult(
             status=STATUS_OPTIMAL, grid=rgb_grid, score=best_score,
-            upper_bound=unit_w * unit_h * _max_freq(tile_counts),
+            upper_bound=min(effective_bound, best_score),
             elapsed_seconds=min(time.perf_counter() - started, time_limit),
             solver_name="cp-sat+localsearch")
         result.tile_usage = _tile_usage(tile_counts, rgb_grid, unit_w, unit_h)
@@ -276,7 +289,7 @@ def _solve_cpsat(
         return SolveResult(
             status=STATUS_UNKNOWN,
             elapsed_seconds=min(time.perf_counter() - started, time_limit),
-            upper_bound=unit_w * unit_h * _max_freq(tile_counts),
+            upper_bound=effective_bound,
             solver_name="cp-sat+localsearch")
 
     idx_grid = [
@@ -294,25 +307,25 @@ def _solve_cpsat(
     best_grid = idx_grid
     best_score = _score_idx_grid(
         quad_freq_idx, idx_grid, unit_w, unit_h)
-    if time.perf_counter() < local_deadline:
+    # 合法候选已达到外部折算上界 -> 直接停搜，标记已证最优
+    if best_score < effective_bound and time.perf_counter() < local_deadline:
         best_grid, best_score = _local_search(
             idx_grid, quad_colors, quad_freq_idx, palette,
-            unit_w, unit_h, fixed_idx, local_deadline)
+            unit_w, unit_h, fixed_idx, local_deadline, effective_bound)
 
     rgb_grid = tuple(
         tuple(palette[best_grid[y][x]] for x in range(unit_w))
         for y in range(unit_h)
     )
-    upper_bound = unit_w * unit_h * _max_freq(tile_counts)
-    # 达到理论上界 => 已证最优；否则只是当前找到的最佳可行纹样
+    # 达到有效上界 => 已证最优；否则只是当前找到的最佳可行纹样
     final_status = (
-        STATUS_OPTIMAL if best_score >= upper_bound else STATUS_FEASIBLE)
+        STATUS_OPTIMAL if best_score >= effective_bound else STATUS_FEASIBLE)
 
     result = SolveResult(
         status=final_status,
         grid=rgb_grid,
         score=best_score,
-        upper_bound=upper_bound,
+        upper_bound=effective_bound,
         elapsed_seconds=min(time.perf_counter() - started, time_limit),
         solver_name="cp-sat+localsearch",
     )
@@ -389,8 +402,12 @@ def _local_search(
     unit_h: int,
     fixed_idx: dict[tuple[int, int], int],
     deadline: float,
+    stop_bound: Optional[int] = None,
 ) -> tuple[list[list[int]], int]:
-    """单格变色爬山 + 随机重启，返回 (最佳下标网格, 得分)。"""
+    """单格变色爬山 + 随机重启，返回 (最佳下标网格, 得分)。
+
+    ``stop_bound`` 为外部已证上界：得分一旦达到即提前停搜。
+    """
     rng = random.Random(20261123)
     valid_quads = set(quad_colors)
     n_colors = len(palette)
@@ -458,6 +475,8 @@ def _local_search(
 
     best_grid = [row[:] for row in idx_grid]
     best_score = score(best_grid)
+    if stop_bound is None:
+        stop_bound = unit_w * unit_h * max(quad_freq_idx.values())
 
     # 多起点随机重启；hard_deadline 即调用方给定的绝对截止时间，
     # 单次 hill_climb 内部也在每格判断该时间，保证不会显著超时。
@@ -468,7 +487,7 @@ def _local_search(
         if candidate_score > best_score:
             best_grid = candidate
             best_score = candidate_score
-        if best_score >= unit_w * unit_h * max(quad_freq_idx.values()):
+        if best_score >= stop_bound:
             break
         # 随机扰动若干非固定格后重启，帮助跳出局部最优
         if time.perf_counter() >= deadline:
@@ -502,6 +521,7 @@ def _solve_backtrack(
     unit_h: int,
     fixed: dict[tuple[int, int], RGB],
     time_limit: float,
+    upper_bound_hint: Optional[int] = None,
 ) -> SolveResult:
     """行编码回溯 + 分支定界（无 OR-Tools 时的兜底实现）。
 
@@ -513,6 +533,11 @@ def _solve_backtrack(
     deadline = started + time_limit
     color_index = {c: i for i, c in enumerate(palette)}
     base = len(palette)
+    # 有效上界 = min(通用上界, 外部折算上界)，各 UNKNOWN 分支统一使用
+    full_bound = unit_w * unit_h * _max_freq(tile_counts)
+    stop_bound = (
+        min(full_bound, upper_bound_hint)
+        if upper_bound_hint is not None else full_bound)
 
     for color in fixed.values():
         if color not in color_index:
@@ -582,7 +607,7 @@ def _solve_backtrack(
             return SolveResult(
                 status=STATUS_UNKNOWN,
                 elapsed_seconds=min(time.perf_counter() - started, time_limit),
-                upper_bound=unit_w * unit_h * _max_freq(tile_counts),
+                upper_bound=stop_bound,
                 solver_name="backtrack")
         if not rows:
             return SolveResult(status=STATUS_INFEASIBLE,
@@ -617,11 +642,11 @@ def _solve_backtrack(
     best: Optional[list[list[int]]] = None
     best_score = -1
     proved_optimal = True
-    full_bound = unit_w * unit_h * _max_freq(tile_counts)
+    bound_hit = False
 
     def dfs(y: int) -> None:
-        nonlocal best, best_score, proved_optimal
-        if time.perf_counter() >= deadline:
+        nonlocal best, best_score, proved_optimal, bound_hit
+        if bound_hit or time.perf_counter() >= deadline:
             proved_optimal = False
             return
         if y == unit_h:
@@ -631,6 +656,8 @@ def _solve_backtrack(
             if current_score > best_score:
                 best_score = current_score
                 best = [r.copy() for r in chosen_rows]
+                if current_score >= stop_bound:
+                    bound_hit = True
             return
         for row_int in candidates[y]:
             cells = row_cells(row_int)
@@ -641,6 +668,8 @@ def _solve_backtrack(
             chosen_rows.append(cells)
             dfs(y + 1)
             chosen_rows.pop()
+            if bound_hit:
+                return
             if time.perf_counter() >= deadline:
                 proved_optimal = False
                 return
@@ -652,12 +681,19 @@ def _solve_backtrack(
             return SolveResult(status=STATUS_INFEASIBLE, elapsed_seconds=elapsed,
                                solver_name="backtrack")
         return SolveResult(status=STATUS_UNKNOWN, elapsed_seconds=elapsed,
-                           upper_bound=full_bound, solver_name="backtrack")
+                           upper_bound=stop_bound, solver_name="backtrack")
 
     grid = tuple(tuple(palette[c] for c in row) for row in best)
-    status = STATUS_OPTIMAL if proved_optimal else STATUS_FEASIBLE
+    # 命中折算上界即视为已证最优；否则必须穷尽搜索（proved_optimal）才算
+    status = (
+        STATUS_OPTIMAL if (bound_hit or proved_optimal) else STATUS_FEASIBLE)
+    if status == STATUS_OPTIMAL:
+        result_bound = best_score
+    else:
+        # 未证最优：上界取通用上界与外部折算上界的小者
+        result_bound = stop_bound
     result = SolveResult(status=status, grid=grid, score=best_score,
-                         upper_bound=best_score if proved_optimal else full_bound,
+                         upper_bound=result_bound,
                          elapsed_seconds=min(elapsed, time_limit),
                          solver_name="backtrack")
     result.tile_usage = _tile_usage(tile_counts, grid, unit_w, unit_h)
